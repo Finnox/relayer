@@ -10,7 +10,7 @@ use std::{
 };
 
 use cached::{Cached, TimedCache};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use jito_core::ofac::is_tx_ofac_related;
 use jito_protos::{
     auth::{
@@ -25,6 +25,8 @@ use jito_protos::{
     },
     convert::packet_to_proto_packet,
     packet::PacketBatch as ProtoPacketBatch,
+    ping::ping_service_client::PingServiceClient,
+    ping::PingRequest,
     shared::{Header, Heartbeat},
 };
 use log::{error, *};
@@ -40,7 +42,7 @@ use tokio::{
     runtime::Runtime,
     select,
     sync::mpsc::{channel, Receiver, Sender},
-    time::{interval, sleep},
+    time::{interval, sleep, Interval},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
@@ -51,6 +53,9 @@ use tonic::{
 };
 
 use crate::block_engine_stats::BlockEngineStats;
+
+static ENGINE_REGIONS: &[&str] = &["ny", "amsterdam", "frankfurt", "tokyo", "slc"];
+const BASE_URL: &str = "vanguards.wtf:50051";
 
 pub struct BlockEngineConfig {
     pub block_engine_url: String,
@@ -93,6 +98,58 @@ pub enum BlockEngineError {
 
     #[error("block engine failed: {0}")]
     BlockEngineFailure(String),
+
+    #[error("engine search failed")]
+    EngineSearchFailed(Box<dyn std::error::Error>),
+}
+
+async fn ping_server(url: &str) -> Result<Duration, Box<dyn std::error::Error>> {
+    let mut client = PingServiceClient::connect(url.to_string()).await?;
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let request = tonic::Request::new(PingRequest {});
+        let start = Instant::now();
+        client.ping(request).await?;
+        let elapsed = start.elapsed();
+        times.push(elapsed);
+    }
+    times.sort_unstable();
+    let median = times[times.len() / 2];
+    Ok(median)
+}
+async fn find_closest_engine() -> Result<BlockEngineConfig, Box<dyn std::error::Error>> {
+    let mut best_url = None;
+    let mut best_ping = Duration::from_secs(u64::MAX);
+    for &region in ENGINE_REGIONS {
+        let engine_url = format!("http://{}.{}", region, BASE_URL);
+        match ping_server(&engine_url).await {
+            Ok(median_ping) => {
+                if median_ping < best_ping {
+                    best_ping = median_ping;
+                    best_url = Some(engine_url);
+                }
+            }
+            Err(err) => {
+                error!("Ping to {} failed with error: {:?}", engine_url, err);
+            }
+        }
+    }
+    match best_url {
+        Some(url) => {
+            info!("Best engine found: {} with ping: {:?}", url, best_ping);
+            Ok(BlockEngineConfig {
+                block_engine_url: url.clone(),
+                auth_service_url: url,
+            })
+        }
+        None => {
+            error!("No available engine found");
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No available engine",
+            )) as Box<dyn std::error::Error>)
+        }
+    }
 }
 
 pub type BlockEngineResult<T> = Result<T, BlockEngineError>;
@@ -117,41 +174,50 @@ impl BlockEngineRelayerHandler {
         ofac_addresses: HashSet<Pubkey>,
     ) -> BlockEngineRelayerHandler {
         let is_connected_to_block_engine = is_connected_to_block_engine.clone();
-        let block_engine_forwarder = block_engine_config.map(|config| {
+        let block_engine_forwarder = Some(
             Builder::new()
                 .name("block_engine_relayer_handler_thread".into())
                 .spawn(move || {
                     let rt = Runtime::new().unwrap();
                     rt.block_on(async move {
                         while !exit.load(Ordering::Relaxed) {
-                            let result = Self::auth_and_connect(
-                                &config.block_engine_url,
-                                &config.auth_service_url,
-                                &mut block_engine_receiver,
-                                &keypair,
-                                &exit,
-                                aoi_cache_ttl_s,
-                                &address_lookup_table_cache,
-                                &is_connected_to_block_engine,
-                                &ofac_addresses,
-                            )
-                            .await;
-                            is_connected_to_block_engine.store(false, Ordering::Relaxed);
+                            match find_closest_engine().await {
+                                Ok(config) => {
+                                    let result = Self::auth_and_connect(
+                                        &config.block_engine_url,
+                                        &config.auth_service_url,
+                                        &mut block_engine_receiver,
+                                        &keypair,
+                                        &exit,
+                                        aoi_cache_ttl_s,
+                                        &address_lookup_table_cache,
+                                        &is_connected_to_block_engine,
+                                        &ofac_addresses,
+                                    )
+                                    .await;
+                                    is_connected_to_block_engine.store(false, Ordering::Relaxed);
 
-                            if let Err(e) = result {
-                                error!("error authenticating and connecting: {:?}", e);
-                                datapoint_error!("block_engine_relayer-error",
-                                    "block_engine_url" => &config.block_engine_url,
-                                    "auth_service_url" => &config.auth_service_url,
-                                    ("error", e.to_string(), String)
-                                );
-                                sleep(Duration::from_secs(2)).await;
+                                    if let Err(e) = result {
+                                        error!("Error authenticating and connecting: {:?}", e);
+                                        datapoint_error!(
+                                            "block_engine_relayer-error",
+                                            ("block_engine_url", &config.block_engine_url, String),
+                                            ("auth_service_url", &config.auth_service_url, String),
+                                            ("error", e.to_string(), String)
+                                        );
+                                        sleep(Duration::from_secs(2)).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Error finding closest engine: {:?}", e);
+                                    sleep(Duration::from_secs(2)).await;
+                                }
                             }
                         }
                     });
                 })
-                .unwrap()
-        });
+                .unwrap(),
+        );
         BlockEngineRelayerHandler {
             block_engine_forwarder,
         }
@@ -315,6 +381,8 @@ impl BlockEngineRelayerHandler {
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
+        let flush_interval = interval(Duration::from_secs(60));
+        let txns_cache = Arc::new(DashSet::new());
         let subscribe_aoi_stream = client
             .subscribe_accounts_of_interest(AccountsOfInterestRequest {})
             .await
@@ -346,6 +414,8 @@ impl BlockEngineRelayerHandler {
             address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
+            txns_cache.clone(),
+            flush_interval,
         )
         .await
     }
@@ -365,6 +435,8 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        txns_cache: Arc<DashSet<String>>,
+        mut flush_interval: Interval,
     ) -> BlockEngineResult<()> {
         let mut aoi_stream = subscribe_aoi_stream.into_inner();
         let mut poi_stream = subscribe_poi_stream.into_inner();
@@ -434,7 +506,7 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, txns_cache.clone());
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
@@ -469,6 +541,9 @@ impl BlockEngineRelayerHandler {
 
                     block_engine_stats.report();
                     block_engine_stats = BlockEngineStats::default();
+                }
+                _ = flush_interval.tick() => {
+                    txns_cache.clear();
                 }
             }
 
@@ -638,16 +713,23 @@ impl BlockEngineRelayerHandler {
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
+        txns_cache: Arc<DashSet<String>>,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
 
         for batch in &block_engine_batches.banking_packet_batch.0 {
             for packet in batch {
-                if packet.meta().discard() {
+                if packet.meta().discard() || packet.meta().is_simple_vote_tx() {
                     continue;
                 }
 
                 if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
+                    let tx_signature = tx.signatures[0].to_string();
+
+                    if txns_cache.contains(&tx_signature) {
+                        continue;
+                    }
+
                     let is_forwardable = if ofac_addresses.is_empty() {
                         is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
                             || is_aoi_in_lookup_table(
@@ -672,7 +754,8 @@ impl BlockEngineRelayerHandler {
 
                     if is_forwardable {
                         if let Some(packet) = packet_to_proto_packet(packet) {
-                            filtered_packets.push(packet)
+                            filtered_packets.push(packet);
+                            txns_cache.insert(tx_signature);
                         }
                     }
                 }
