@@ -425,6 +425,7 @@ impl RelayerImpl {
         validator_packet_batch_size: usize,
         forward_all: bool,
         slot_lookahead: u64,
+        slot_leaders_shared: Arc<RwLock<HashSet<Pubkey>>>,
     ) -> Self {
         // receiver tracked as relayer_metrics.subscription_receiver_len
         let (subscription_sender, subscription_receiver) =
@@ -451,6 +452,7 @@ impl RelayerImpl {
                         address_lookup_table_cache,
                         validator_packet_batch_size,
                         forward_all,
+                        slot_leaders_shared,
                     );
                     warn!("RelayerImpl thread exited with result {res:?}")
                 })
@@ -487,6 +489,7 @@ impl RelayerImpl {
         address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         validator_packet_batch_size: usize,
         forward_all: bool,
+        slot_leaders_shared: Arc<RwLock<HashSet<Pubkey>>>,
     ) -> RelayerResult<()> {
         let mut highest_slot = Slot::default();
 
@@ -510,6 +513,11 @@ impl RelayerImpl {
 
                     let slots: Vec<_> = (highest_slot..highest_slot + slot_lookahead).collect();
                     slot_leaders = leader_schedule_cache.leaders_for_slots(&slots);
+
+                    {
+                        let mut leaders = slot_leaders_shared.write().unwrap();
+                        *leaders = slot_leaders.clone();
+                    }
 
                     let _ = relayer_metrics.crossbeam_slot_receiver_processing_us.increment(start.elapsed().as_micros() as u64);
                 },

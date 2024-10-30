@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread::{Builder, JoinHandle},
     time::{Duration, Instant, SystemTime},
@@ -164,7 +164,7 @@ impl BlockEngineRelayerHandler {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        block_engine_config: Option<BlockEngineConfig>,
+        _block_engine_config: Option<BlockEngineConfig>,
         mut block_engine_receiver: Receiver<BlockEnginePackets>,
         keypair: Arc<Keypair>,
         exit: Arc<AtomicBool>,
@@ -172,6 +172,8 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: HashSet<Pubkey>,
+        slot_leaders_shared: Arc<RwLock<HashSet<Pubkey>>>,
+        validator_pubkey: Option<Pubkey>,
     ) -> BlockEngineRelayerHandler {
         let is_connected_to_block_engine = is_connected_to_block_engine.clone();
         let block_engine_forwarder = Some(
@@ -193,6 +195,8 @@ impl BlockEngineRelayerHandler {
                                         &address_lookup_table_cache,
                                         &is_connected_to_block_engine,
                                         &ofac_addresses,
+                                        &slot_leaders_shared,
+                                        validator_pubkey.as_ref(),
                                     )
                                     .await;
                                     is_connected_to_block_engine.store(false, Ordering::Relaxed);
@@ -293,6 +297,8 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        slot_leaders_shared: &Arc<RwLock<HashSet<Pubkey>>>,
+        validator_pubkey: Option<&Pubkey>,
     ) -> BlockEngineResult<()> {
         let mut auth_endpoint = Endpoint::from_str(auth_service_url).expect("valid auth url");
         if auth_service_url.contains("https") {
@@ -358,6 +364,8 @@ impl BlockEngineRelayerHandler {
             address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
+            slot_leaders_shared,
+            validator_pubkey,
         )
         .await
     }
@@ -380,6 +388,8 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        slot_leaders_shared: &Arc<RwLock<HashSet<Pubkey>>>,
+        validator_pubkey: Option<&Pubkey>,
     ) -> BlockEngineResult<()> {
         let flush_interval = interval(Duration::from_secs(60));
         let txns_cache = Arc::new(DashSet::new());
@@ -416,6 +426,8 @@ impl BlockEngineRelayerHandler {
             ofac_addresses,
             txns_cache.clone(),
             flush_interval,
+            slot_leaders_shared,
+            validator_pubkey,
         )
         .await
     }
@@ -437,6 +449,8 @@ impl BlockEngineRelayerHandler {
         ofac_addresses: &HashSet<Pubkey>,
         txns_cache: Arc<DashSet<String>>,
         mut flush_interval: Interval,
+        slot_leaders_shared: &Arc<RwLock<HashSet<Pubkey>>>,
+        validator_pubkey: Option<&Pubkey>,
     ) -> BlockEngineResult<()> {
         let mut aoi_stream = subscribe_aoi_stream.into_inner();
         let mut poi_stream = subscribe_poi_stream.into_inner();
@@ -501,6 +515,15 @@ impl BlockEngineRelayerHandler {
                         .ok_or_else(|| BlockEngineError::BlockEngineFailure("block engine packet receiver disconnected".to_string()))?;
 
                     let now = Instant::now();
+
+                    let slot_leaders = slot_leaders_shared.read().unwrap();
+
+                    if let Some(validator_pubkey) = validator_pubkey {
+                        if slot_leaders.contains(validator_pubkey) {
+                            info!("Validator pubkey is in leader slots, skipping packet forwarding.");
+                            continue;
+                        }
+                    }
 
                     // note: this contains discarded packets too
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();

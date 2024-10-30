@@ -5,6 +5,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     str::FromStr,
+    sync::RwLock,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -151,6 +152,10 @@ struct Args {
     /// If null then all validators on the leader schedule shall be permitted.
     #[arg(long, env, value_delimiter = ',')]
     allowed_validators: Option<Vec<Pubkey>>,
+
+    /// New
+    #[arg(long, env)]
+    validator_pubkey: Option<Pubkey>,
 
     /// The private key used to sign tokens by this server.
     #[arg(long, env)]
@@ -486,6 +491,8 @@ fn main() {
         &exit,
     );
 
+    let slot_leaders_shared: Arc<RwLock<HashSet<Pubkey>>> = Arc::new(RwLock::new(HashSet::new()));
+
     let is_connected_to_block_engine = Arc::new(AtomicBool::new(false));
     let block_engine_config = if !args.disable_mempool && args.block_engine_url.is_some() {
         let block_engine_url = args.block_engine_url.unwrap();
@@ -499,6 +506,9 @@ fn main() {
     } else {
         None
     };
+
+    let validator_pubkey = args.validator_pubkey;
+
     let block_engine_forwarder = BlockEngineRelayerHandler::new(
         block_engine_config,
         block_engine_receiver,
@@ -508,6 +518,8 @@ fn main() {
         address_lookup_table_cache.clone(),
         &is_connected_to_block_engine,
         ofac_addresses.clone(),
+        slot_leaders_shared.clone(),
+        validator_pubkey,
     );
 
     // receiver tracked as relayer_metrics.slot_receiver_len
@@ -536,6 +548,7 @@ fn main() {
         args.validator_packet_batch_size,
         args.forward_all,
         args.slot_lookahead,
+        slot_leaders_shared.clone(),
     );
 
     let priv_key = fs::read(&args.signing_key_pem_path).unwrap_or_else(|_| {
