@@ -18,8 +18,9 @@ fn main() {
                 "protos/relayer.proto",
                 "protos/searcher.proto",
                 "protos/shared.proto",
+                "custom-protos/ping.proto",
             ],
-            &["protos"],
+            &["protos", "custom-protos"],
         )
         .unwrap();
 }

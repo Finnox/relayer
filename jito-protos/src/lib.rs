@@ -31,3 +31,7 @@ pub mod searcher {
 pub mod shared {
     tonic::include_proto!("shared");
 }
+
+pub mod ping {
+    tonic::include_proto!("ping");
+}
